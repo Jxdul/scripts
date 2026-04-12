@@ -1,11 +1,19 @@
 import argparse
+import base64
+import binascii
 import hashlib
+import hmac
 import itertools
 import string
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import os
+
+# Stored password format: base64(salt):base64(derived), PBKDF2-HMAC-SHA256.
+PBKDF2_SHA256_ITERATIONS = 100_000
+PBKDF2_SHA256_DKLEN = 32
+PBKDF2_SHA256_SALT_LEN = 16
 
 
 def default_worker_count():
@@ -30,15 +38,15 @@ def default_worker_count():
 
 def default_batch_size(workers):
     """Larger batches amortize IPC; cap so a single batch does not dominate RAM."""
-    return min(150_000, max(45_000, workers * 10_000))
+    return min(280_000, max(80_000, workers * 18_000))
 
 
 def default_max_in_flight(workers):
     """
-    Deep enough to keep all workers busy; capped so we do not queue thousands
-    of large batches (each holds one full chunk of candidates).
+    Deep pipeline so workers stay busy; capped so we do not queue unbounded
+    batches (each holds one full chunk of candidates).
     """
-    return max(min(workers * 12, 200), workers + 8)
+    return max(min(workers * 20, 320), workers + 16)
 
 
 CHARSET_PRESETS = {
@@ -56,6 +64,50 @@ def process_batch(batch, hash_type, target_hex_lower):
         h = hashlib.new(hash_type)
         h.update(attempt.encode("utf-8"))
         if h.hexdigest() == target_hex_lower:
+            return attempt
+    return None
+
+
+def parse_pbkdf2_sha256_stored(stored: str) -> tuple[bytes, bytes]:
+    """
+    Parse password_hash value: base64(salt):base64(derived).
+    Salt is 16 bytes; derived key is 32 bytes (256 bits).
+    """
+    s = stored.strip()
+    parts = s.split(":")
+    if len(parts) != 2:
+        raise ValueError(
+            "PBKDF2 stored value must be 'base64(salt):base64(derived)' "
+            "with exactly one ':' separator"
+        )
+    try:
+        salt = base64.b64decode(parts[0])
+        derived = base64.b64decode(parts[1])
+    except binascii.Error as e:
+        raise ValueError(f"invalid base64 in stored hash: {e}") from e
+    if len(salt) != PBKDF2_SHA256_SALT_LEN:
+        raise ValueError(
+            f"salt must decode to {PBKDF2_SHA256_SALT_LEN} bytes, got {len(salt)}"
+        )
+    if len(derived) != PBKDF2_SHA256_DKLEN:
+        raise ValueError(
+            f"derived key must be {PBKDF2_SHA256_DKLEN} bytes, got {len(derived)}"
+        )
+    return salt, derived
+
+
+def process_batch_pbkdf2_sha256(batch, salt, expected_derived):
+    """Process a batch of candidates using PBKDF2-HMAC-SHA256."""
+    for candidate in batch:
+        attempt = "".join(candidate)
+        derived = hashlib.pbkdf2_hmac(
+            "sha256",
+            attempt.encode("utf-8"),
+            salt,
+            PBKDF2_SHA256_ITERATIONS,
+            dklen=PBKDF2_SHA256_DKLEN,
+        )
+        if hmac.compare_digest(derived, expected_derived):
             return attempt
     return None
 
@@ -107,14 +159,33 @@ def crack_hash(
         charset = CHARSET_PRESETS["lowdigit"]
 
     workers = workers if workers is not None else default_worker_count()
-    target_hex_lower = target_hash.strip().lower()
+    hash_type_l = hash_type.strip().lower()
+    pbkdf2_mode = hash_type_l == "pbkdf2_sha256"
+    if pbkdf2_mode:
+        salt, expected_derived = parse_pbkdf2_sha256_stored(target_hash)
+        target_hex_lower = None
+    else:
+        salt = expected_derived = None
+        target_hex_lower = target_hash.strip().lower()
+
     if batch_size is None:
         batch_size = default_batch_size(workers)
     if max_in_flight is None:
         max_in_flight = default_max_in_flight(workers)
 
+    if pbkdf2_mode:
+        # Each candidate runs full PBKDF2 (100k iterations); keep tasks small
+        # so workers stay fed without one batch dominating wall time.
+        batch_size = min(batch_size, max(256, workers * 64))
+
     ks = estimate_keyspace(len(charset), min_length, max_length)
-    print(f"Starting brute-force for {hash_type.upper()} hash: {target_hash}")
+    if pbkdf2_mode:
+        print(
+            f"Starting brute-force for PBKDF2-HMAC-SHA256 "
+            f"({PBKDF2_SHA256_ITERATIONS} iterations, dklen={PBKDF2_SHA256_DKLEN} bytes)"
+        )
+    else:
+        print(f"Starting brute-force for {hash_type_l.upper()} hash: {target_hash}")
     print(
         f"Charset size: {len(charset)} | Length {min_length}..{max_length} | "
         f"Workers: {workers} | Batch: {batch_size} | In-flight cap: {max_in_flight}"
@@ -194,8 +265,13 @@ def crack_hash(
             print(f"Trying length {length} (~{length_space:,} candidates)...", flush=True)
 
             if progress_on and progress_thread is None:
+                what = (
+                    "PBKDF2 attempts"
+                    if pbkdf2_mode
+                    else "candidate strings hashed"
+                )
                 print(
-                    f"Streaming progress every {progress_interval} s (candidate strings hashed).",
+                    f"Streaming progress every {progress_interval} s ({what}).",
                     flush=True,
                 )
                 progress_thread = threading.Thread(target=progress_loop, daemon=True)
@@ -219,9 +295,17 @@ def crack_hash(
                     if found:
                         break
 
-                    fut = executor.submit(
-                        process_batch, batch, hash_type, target_hex_lower
-                    )
+                    if pbkdf2_mode:
+                        fut = executor.submit(
+                            process_batch_pbkdf2_sha256,
+                            batch,
+                            salt,
+                            expected_derived,
+                        )
+                    else:
+                        fut = executor.submit(
+                            process_batch, batch, hash_type_l, target_hex_lower
+                        )
                     fut_sizes[fut] = len(batch)
                     pending.add(fut)
                     state["in_flight"] = len(pending)
@@ -262,8 +346,17 @@ def main():
         description="Brute-force a hash over candidate strings (short passwords only).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("hash_type", help="e.g. md5, sha1, sha256, sha512")
-    parser.add_argument("target_hash", help="hex digest to match")
+    parser.add_argument(
+        "hash_type",
+        help=(
+            "e.g. md5, sha1, sha256, sha512, or pbkdf2_sha256 "
+            "(stored form base64(salt):base64(derived))"
+        ),
+    )
+    parser.add_argument(
+        "target_hash",
+        help="hex digest to match, or for pbkdf2_sha256 the full colon-separated stored value",
+    )
     parser.add_argument(
         "--min",
         type=int,
@@ -312,14 +405,14 @@ def main():
         type=int,
         default=None,
         metavar="N",
-        help="Max concurrent batches (default: ~12× workers, capped for RAM)",
+        help="Max concurrent batches (default: ~20× workers, capped for RAM)",
     )
     parser.add_argument(
         "--turbo",
         action="store_true",
         help=(
-            "Larger batches and deeper pipeline (more RAM, better CPU saturation "
-            "on big machines)"
+            "Extra-large batches and very deep pipeline (max RAM & CPU throughput; "
+            "use if you have headroom)"
         ),
     )
     parser.add_argument(
@@ -362,21 +455,24 @@ def main():
     if args.turbo:
         w = args.workers if args.workers is not None else default_worker_count()
         if batch_size is None:
-            batch_size = min(280_000, max(80_000, w * 18_000))
+            batch_size = min(450_000, max(120_000, w * 28_000))
         if max_in_flight is None:
-            max_in_flight = max(min(w * 20, 320), w + 16)
+            max_in_flight = max(min(w * 28, 512), w + 24)
 
-    crack_hash(
-        args.target_hash,
-        hash_type=args.hash_type.lower(),
-        min_length=args.min,
-        max_length=args.max,
-        charset=charset,
-        workers=args.workers,
-        batch_size=batch_size,
-        max_in_flight=max_in_flight,
-        progress_interval=progress_interval,
-    )
+    try:
+        crack_hash(
+            args.target_hash,
+            hash_type=args.hash_type.lower(),
+            min_length=args.min,
+            max_length=args.max,
+            charset=charset,
+            workers=args.workers,
+            batch_size=batch_size,
+            max_in_flight=max_in_flight,
+            progress_interval=progress_interval,
+        )
+    except ValueError as e:
+        parser.error(str(e))
 
 
 if __name__ == "__main__":
